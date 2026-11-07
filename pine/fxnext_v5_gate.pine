@@ -10,7 +10,10 @@ grpCost = "Cost model"
 spreadPips   = input.float(1.2, "Round-trip spread (pips)", minval=0.0, step=0.1, group=grpCost,
      tooltip="TradingView has no bid/ask. Enter your broker's typical spread for this pair. OANDA US spread-only published: EURUSD 1.4, USDJPY 1.4, GBPUSD 2.0, GBPJPY 3.1, AUDUSD 1.4, USDCHF 1.8, NZDUSD 1.7, EURGBP 1.7.")
 pipOverride  = input.float(0.0, "Pip size (0 = auto from mintick × 10)", minval=0.0, step=0.0001, group=grpCost)
+reopenMult   = input.float(3.0, "Spread multiplier for an entry at the 17:05 NY reopen", minval=1.0, step=0.5, group=grpCost,
+     tooltip="4h and D1 bars close at 17:00 New York inside the 16:59–17:05 closure, so the next open is the reopen print, where the spread is several times the session median. Every D1 entry here is at the reopen; the 17:00 4h call is removed by the roll exclusion.")
 adminFeePct  = input.float(1.0, "Financing admin fee (% p.a., charged each side)", minval=0.0, step=0.25, group=grpCost)
+eurDFR       = input.float(0.0, "EUR rate override (% p.a., ECB deposit facility; 0 = ECONOMICS:EUINTR, which is the MRO)", minval=0.0, step=0.05, group=grpCost)
 useCarryGate = input.bool(true, "Charge expected financing inside the cost gate", group=grpCost)
 costMax1h    = input.float(0.09, "Max cost / ATR at 1h", minval=0.0, step=0.01, group=grpCost)
 costMaxHi    = input.float(0.06, "Max cost / ATR at 4h and D1", minval=0.0, step=0.01, group=grpCost)
@@ -22,16 +25,17 @@ atrLen = input.int(14, "ATR length", minval=2, group=grpLab)
 
 grpSig = "Direction score"
 minScore   = input.int(4, "Min |score| to call (score range −6…6)", minval=1, maxval=6, group=grpSig)
-requireHTF = input.bool(true, "Block calls the higher timeframe opposes", group=grpSig)
+requireHTF = input.bool(true, "Block calls the parent timeframe opposes (1h→4h, 4h→D; D1 has no parent)", group=grpSig)
 
 grpSess = "Entry-time exclusions (New York time unless stated)"
 useSess         = input.bool(true, "Only London 08:00–16:30 or New York 08:00–17:00 (local time)", group=grpSess)
-excludeReleases = input.bool(true, "Exclude 08:25–08:45, 09:55–10:15, 13:55–14:30 (release slots)", group=grpSess)
+excludeReleases = input.bool(true, "Exclude 08:25–08:45, 09:55–10:15, 13:55–14:30 NY every day (release stand-in)", group=grpSess,
+     tooltip="Daily stand-in for the document's rule, which needs a calendar Pine does not have: no entry within 60 minutes before or 15 minutes after a scheduled high-impact release in either currency, on release days only. These slots cover BLS 08:30, BoC 10:00 (09:45 since 2024) and FOMC 14:00 New York and apply every day; they do not cover ECB 14:15 CET, BoE 12:00 London, SNB 09:30 Zurich or Eurostat 11:00.")
 excludeRoll     = input.bool(true, "Exclude 16:30–17:30 (daily close and reopen)", group=grpSess)
-excludeThin     = input.bool(true, "Exclude 22 Dec – 2 Jan", group=grpSess)
+excludeThin     = input.bool(true, "Exclude 22 Dec – 2 Jan (doc also flags Good Friday–Easter Monday and US/UK bank holidays; not implemented)", group=grpSess)
 
 grpBoard = "Scoreboard"
-minCallsForVerdict = input.int(200, "Calls needed before a verdict is shown", minval=20, group=grpBoard)
+minCallsForVerdict = input.int(200, "Closed calls needed before a screen result is shown", minval=20, group=grpBoard)
 showBoard          = input.bool(true, "Show scoreboard", group=grpBoard)
 
 // ───────────────────────────── timeframe ─────────────────────────────
@@ -41,13 +45,14 @@ is1h     = tfSec == 3600
 is4h     = tfSec == 14400
 isD      = timeframe.isdaily
 tfOK     = is1h or is4h or isD
-htf      = is1h ? "240" : is4h ? "D" : "W"
+htf      = is1h ? "240" : "D"          // D1 has no parent (doc, Models); the "D" request on a D1 chart is unused
 costMax  = is1h ? costMax1h : costMaxHi
 
 // ───────────────────────────── cost model ─────────────────────────────
-pip  = pipOverride > 0 ? pipOverride : syminfo.mintick * 10
-spr  = spreadPips * pip
-atr  = ta.atr(atrLen)
+pip     = pipOverride > 0 ? pipOverride : syminfo.mintick * 10
+spr     = spreadPips * pip
+sprGate = isD ? spr * reopenMult : spr   // every D1 entry is at the 17:05 reopen
+atr     = ta.atr(atrLen)
 
 // policy rates from TradingView Economics, keyed by two-letter COUNTRY code (ECONOMICS:USINTR, EUINTR, GBINTR, JPINTR …); na if missing
 ccode(string cur) =>
@@ -70,24 +75,27 @@ ccode(string cur) =>
         => ""
 baseCC    = ccode(syminfo.basecurrency)
 quoteCC   = ccode(syminfo.currency)
-baseRate  = request.security("ECONOMICS:" + baseCC + "INTR", "D", close, ignore_invalid_symbol=true)
-quoteRate = request.security("ECONOMICS:" + quoteCC + "INTR", "D", close, ignore_invalid_symbol=true)
+baseReq   = request.security("ECONOMICS:" + baseCC + "INTR", "D", close, ignore_invalid_symbol=true)
+quoteReq  = request.security("ECONOMICS:" + quoteCC + "INTR", "D", close, ignore_invalid_symbol=true)
+baseRate  = syminfo.basecurrency == "EUR" and eurDFR > 0 ? eurDFR : baseReq
+quoteRate = syminfo.currency == "EUR" and eurDFR > 0 ? eurDFR : quoteReq
 carryOK   = not na(baseRate) and not na(quoteRate)
 float carry = carryOK ? baseRate - quoteRate : na          // % p.a. a long earns before fees
 
-// pips per night, positive = received, negative = paid; price × rate/365 in quote currency per unit, then in pips
-longRatePct  = carryOK ? carry - adminFeePct : 0.0
-shortRatePct = carryOK ? -carry - adminFeePct : 0.0
+// the 1% admin fee is a known cost on each side even when the policy-rate symbol is missing; only the carry needs the rates
+longRatePct  = (carryOK ? carry : 0.0) - adminFeePct
+shortRatePct = (carryOK ? -carry : 0.0) - adminFeePct
+// pips per night, positive = received, negative = paid: price × rate/365 in quote currency per unit, then in pips
 finLongPips  = close * (longRatePct / 100.0) / 365.0 / pip
 finShortPips = close * (shortRatePct / 100.0) / 365.0 / pip
 
-// expected nights charged over the hold (D1 carries the Wednesday triple roll as ×1.4)
+// expected nights charged over the hold, for the gate (D1 carries the Wednesday triple roll as ×1.4)
 nightsHeld = isD ? hBars * 1.4 : hBars * barHours / 24.0
 
 finCostLong  = useCarryGate ? math.max(0.0, -finLongPips) * nightsHeld * pip : 0.0
 finCostShort = useCarryGate ? math.max(0.0, -finShortPips) * nightsHeld * pip : 0.0
-cLong  = (spr + finCostLong) / atr
-cShort = (spr + finCostShort) / atr
+cLong  = (sprGate + finCostLong) / atr
+cShort = (sprGate + finCostShort) / atr
 costOKLong  = cLong <= costMax
 costOKShort = cShort <= costMax
 
@@ -106,12 +114,12 @@ slope      = e21 - e21[3]
 slopeScore = slope > 0 ? 1 : slope < 0 ? -1 : 0
 score = trendScore + rpScore + rsiScore + slopeScore
 
-// higher timeframe: last COMPLETED bar only (value[1] with lookahead_on is the non-repainting idiom)
+// parent timeframe: last COMPLETED bar only (value[1] with lookahead_on is the non-repainting idiom)
 htfE21  = request.security(syminfo.tickerid, htf, ta.ema(close, 21)[1], lookahead=barmerge.lookahead_on)
 htfE21p = request.security(syminfo.tickerid, htf, ta.ema(close, 21)[4], lookahead=barmerge.lookahead_on)
 htfTrend = htfE21 > htfE21p ? 1 : htfE21 < htfE21p ? -1 : 0
-htfOKLong  = not requireHTF or htfTrend >= 0
-htfOKShort = not requireHTF or htfTrend <= 0
+htfOKLong  = not requireHTF or isD or htfTrend >= 0
+htfOKShort = not requireHTF or isD or htfTrend <= 0
 
 // ───────────────────────────── entry-time exclusions ─────────────────────────────
 // the call is made at bar close and entered on the next bar, so exclusions use the bar's close time
@@ -131,39 +139,47 @@ rollOK = isD or not excludeRoll or not inRoll
 thinOK = not excludeThin or not thin
 timeOK = sessOK and relOK and rollOK and thinOK
 
+// financing accrues at each 17:00 New York roll a position is open through; Wednesday is charged ×3 (doc, Financing)
+isWed = dayofweek(time_close, "America/New_York") == dayofweek.wednesday
+rollsThisBar = (isD or nyMin == 17 * 60) ? (isWed ? 3 : 1) : 0
+
 // ───────────────────────────── the gated call ─────────────────────────────
 rawLong  = score >= minScore
 rawShort = score <= -minScore
 longCall  = tfOK and rawLong and htfOKLong and timeOK and costOKLong and barstate.isconfirmed
 shortCall = tfOK and rawShort and htfOKShort and timeOK and costOKShort and barstate.isconfirmed
-// why a raw signal was blocked (for the board)
-blockedLong  = tfOK and rawLong and not longCall
-blockedShort = tfOK and rawShort and not shortCall
+blockedLong  = tfOK and rawLong and barstate.isconfirmed and not longCall
+blockedShort = tfOK and rawShort and barstate.isconfirmed and not shortCall
 
 // ───────────────────────────── scoreboard: spread-aware triple barrier on own calls ─────────────────────────────
 var array<int>   oDir   = array.new<int>()     // +1 long, −1 short
 var array<float> oEntry = array.new<float>()   // na until filled at next bar's open
 var array<int>   oBar   = array.new<int>()     // entry bar index
 var array<float> oAtr   = array.new<float>()   // ATR at call
-var array<float> oCost  = array.new<float>()   // c at call (for the break-even line)
 var array<float> oFin   = array.new<float>()   // financing pips per night, signed for the call direction
+var array<int>   oRolls = array.new<int>()     // 17:00 NY rolls charged so far
+var array<float> oW     = array.new<float>()   // 1 / (calls open at entry): on-chart stand-in for average uniqueness
 
-var int   nCalls    = 0
-var int   nResolved = 0   // barrier hits
-var int   nWins     = 0   // favourable barrier first
-var int   nTime     = 0   // time stops
-var float pnlAtrSum = 0.0 // net P&L in ATR units, spread and financing included
-var float costSum   = 0.0
+var int   nCalls     = 0
+var int   nResolved  = 0   // barrier hits
+var int   nWins      = 0   // favourable barrier first
+var int   nTime      = 0   // time stops
+var float nResolvedW = 0.0 // uniqueness-weighted counts for the interval
+var float nWinsW     = 0.0
+var float pnlAtrSum  = 0.0 // net P&L in ATR units, spread and realized financing included
+var float costSum    = 0.0 // gate c at call
+var float sprCostSum = 0.0 // spread part of c at call
+var float finCostSum = 0.0 // expected financing part of c at call, signed (+ cost, − credit)
 
 // 1) fill pending entries at this bar's open (close + measured latency in the stack; the open is the Pine stand-in)
 if array.size(oDir) > 0
     for i = 0 to array.size(oDir) - 1
         if na(array.get(oEntry, i))
             d = array.get(oDir, i)
-            array.set(oEntry, i, d == 1 ? open + spr / 2 : open - spr / 2)
+            array.set(oEntry, i, d == 1 ? open + sprGate / 2 : open - sprGate / 2)
             array.set(oBar, i, bar_index)
 
-// 2) resolve open calls against this bar's range, exit side priced on the exit quote
+// 2) resolve open calls against this bar's range; exit side priced on the exit quote; gaps fill at the open
 if array.size(oDir) > 0
     for i = array.size(oDir) - 1 to 0
         e = array.get(oEntry, i)
@@ -172,9 +188,8 @@ if array.size(oDir) > 0
             a   = array.get(oAtr, i)
             eb  = array.get(oBar, i)
             fpn = array.get(oFin, i)
+            wgt = array.get(oW, i)
             held = bar_index - eb + 1
-            nights = isD ? held * 1.4 : held * barHours / 24.0
-            finPx = fpn * nights * pip
             float exitPx = na
             int outcome = 0            // +1 win barrier, −1 loss barrier, 0 time stop
             bool done = false
@@ -182,11 +197,11 @@ if array.size(oDir) > 0
                 upHit = high - spr / 2 >= e + kATR * a
                 dnHit = low  - spr / 2 <= e - kATR * a
                 if dnHit                                   // stop assumed first when both lie inside one bar
-                    exitPx := e - kATR * a
+                    exitPx := math.min(e - kATR * a, open - spr / 2)   // a gap through the stop fills at the open bid
                     outcome := -1
                     done := true
                 else if upHit
-                    exitPx := e + kATR * a
+                    exitPx := math.max(e + kATR * a, open - spr / 2)   // a gap through the target fills at the open, better than the barrier
                     outcome := 1
                     done := true
                 else if held >= hBars
@@ -197,32 +212,39 @@ if array.size(oDir) > 0
                 dnHit = low  + spr / 2 <= e - kATR * a
                 upHit = high + spr / 2 >= e + kATR * a
                 if upHit
-                    exitPx := e + kATR * a
+                    exitPx := math.max(e + kATR * a, open + spr / 2)
                     outcome := -1
                     done := true
                 else if dnHit
-                    exitPx := e - kATR * a
+                    exitPx := math.min(e - kATR * a, open + spr / 2)
                     outcome := 1
                     done := true
                 else if held >= hBars
                     exitPx := close + spr / 2
                     outcome := 0
                     done := true
+            // rolls: a position still open after this bar, or time-stopped at a 17:00 close, is charged this bar's roll
+            rolls = array.get(oRolls, i) + ((done and outcome != 0) ? 0 : rollsThisBar)
+            array.set(oRolls, i, rolls)
             if done
+                finPx = fpn * rolls * pip
                 pnlPx = (d == 1 ? exitPx - e : e - exitPx) + finPx
                 pnlAtrSum += pnlPx / a
                 if outcome == 0
                     nTime += 1
                 else
                     nResolved += 1
+                    nResolvedW += wgt
                     if outcome == 1
                         nWins += 1
+                        nWinsW += wgt
                 array.remove(oDir, i)
                 array.remove(oEntry, i)
                 array.remove(oBar, i)
                 array.remove(oAtr, i)
-                array.remove(oCost, i)
                 array.remove(oFin, i)
+                array.remove(oRolls, i)
+                array.remove(oW, i)
 
 // 3) register this bar's call (entered next bar)
 if longCall or shortCall
@@ -231,10 +253,13 @@ if longCall or shortCall
     array.push(oEntry, float(na))
     array.push(oBar, bar_index)
     array.push(oAtr, atr)
-    array.push(oCost, longCall ? cLong : cShort)
     array.push(oFin, longCall ? finLongPips : finShortPips)
+    array.push(oRolls, 0)
+    array.push(oW, 1.0 / array.size(oDir))
     nCalls += 1
-    costSum += longCall ? cLong : cShort
+    costSum    += longCall ? cLong : cShort
+    sprCostSum += sprGate / atr
+    finCostSum += -(longCall ? finLongPips : finShortPips) * nightsHeld * pip / atr
     // barrier guide lines around this close (entry is next open, so these are approximate)
     upB = close + kATR * atr
     dnB = close - kATR * atr
@@ -245,7 +270,7 @@ if longCall or shortCall
 wilsonLow(float w, float n) =>
     float out = na
     if n > 0
-        z = 1.96
+        z = 2.576                        // 99%, as the doc's hit-rate gate
         p = w / n
         den = 1 + z * z / n
         ctr = p + z * z / (2 * n)
@@ -256,12 +281,17 @@ wilsonLow(float w, float n) =>
 nClosed    = nResolved + nTime
 q          = nClosed > 0 ? nResolved / float(nClosed) : na
 cAvg       = nCalls > 0 ? costSum / nCalls : na
-pStar      = not na(q) and q > 0 ? 0.5 + cAvg / (2 * kATR * q) : na
+cSprAvg    = nCalls > 0 ? sprCostSum / nCalls : na
+cFinAvg    = nCalls > 0 ? finCostSum / nCalls : na
+// Break-even for THESE calls. Barriers are spread-aware, so a resolved call pays exactly ±k·ATR and the spread is already inside
+// the hit rate (doc: "Do not apply the E formula to a spread-aware p"). What remains is the spread paid by time-stopped calls and
+// the financing paid by all calls: E = q·k·(2h−1) − (1−q)·c_spread − c_fin  ⇒  h* = 0.5 + ((1−q)·c_spread + c_fin) / (2·k·q).
+pStar      = not na(q) and q > 0 ? 0.5 + ((1 - q) * cSprAvg + cFinAvg) / (2 * kATR * q) : na
 hitRate    = nResolved > 0 ? nWins / float(nResolved) : na
-hitLow     = wilsonLow(nWins, nResolved)
+hitLowW    = wilsonLow(nWinsW, nResolvedW)    // uniqueness-weighted 99% lower bound
 expectancy = nClosed > 0 ? pnlAtrSum / nClosed : na
-verdictReady = nClosed >= minCallsForVerdict
-edgeShown    = verdictReady and not na(hitLow) and not na(pStar) and hitLow > pStar and expectancy > 0
+screenReady  = nClosed >= minCallsForVerdict
+passesScreen = screenReady and not na(hitLowW) and not na(pStar) and hitLowW > pStar and not na(expectancy) and expectancy > 0 and expectancy >= 0.5 * cAvg
 
 // ───────────────────────────── drawing ─────────────────────────────
 plotshape(longCall,  title="Long call",  style=shape.triangleup,   location=location.belowbar, color=color.new(color.green, 0), size=size.small)
@@ -274,7 +304,7 @@ bgcolor(not tfOK ? color.new(color.gray, 94) : na, title="Untraded timeframe")
 var table board = table.new(position.top_right, 2, 15, border_width=1, frame_color=color.new(color.gray, 60), border_color=color.new(color.gray, 80))
 f3(float x) => na(x) ? "n/a" : str.tostring(x, "#.###")
 pct(float x) => na(x) ? "n/a" : str.tostring(x * 100, "#.#") + "%"
-signed(float x) => not carryOK ? "n/a (not charged)" : (x >= 0 ? "+" : "") + str.tostring(x, "#.##")
+signed(float x) => na(x) ? "n/a" : (x >= 0 ? "+" : "") + str.tostring(x, "#.##")
 cell(int r, string k, string v, color vc) =>
     table.cell(board, 0, r, k, text_color=color.new(color.gray, 0), text_size=size.small, text_halign=text.align_left)
     table.cell(board, 1, r, v, text_color=vc, text_size=size.small, text_halign=text.align_right)
@@ -283,21 +313,21 @@ if showBoard and barstate.islast
     okC  = color.new(color.green, 0)
     badC = color.new(color.red, 0)
     neuC = color.new(color.white, 0)
-    cell(0, "FX NEXT v5", tfOK ? (is1h ? "1h → 4h parent" : is4h ? "4h → D parent" : "D1 → W parent") : "timeframe not traded (use 1h, 4h, D)", tfOK ? neuC : badC)
-    cell(1, "Spread (pips) / ATR (pips)", str.tostring(spreadPips, "#.#") + " / " + str.tostring(atr / pip, "#.#"), neuC)
-    cell(2, "Carry base−quote (% p.a.)", carryOK ? str.tostring(carry, "#.##") + "  (" + syminfo.basecurrency + " " + str.tostring(baseRate, "#.##") + " − " + syminfo.currency + " " + str.tostring(quoteRate, "#.##") + ")" : "n/a (no ECONOMICS rate)", neuC)
-    cell(3, "Financing pips/night long / short", signed(finLongPips) + " / " + signed(finShortPips), carryOK ? neuC : color.new(color.gray, 0))
+    cell(0, "FX NEXT v5", tfOK ? (is1h ? "1h → 4h parent" : is4h ? "4h → D parent" : "D1 → no parent (unfiltered)") : "timeframe not traded (use 1h, 4h, D)", tfOK ? neuC : badC)
+    cell(1, "Spread (pips) / ATR (pips)", str.tostring(spreadPips, "#.#") + (isD ? " ×" + str.tostring(reopenMult, "#.#") + " reopen" : "") + " / " + str.tostring(atr / pip, "#.#"), neuC)
+    cell(2, "Carry base−quote (% p.a.)", carryOK ? str.tostring(carry, "#.##") + "  (" + syminfo.basecurrency + " " + str.tostring(baseRate, "#.##") + " − " + syminfo.currency + " " + str.tostring(quoteRate, "#.##") + ")" : "n/a (no ECONOMICS rate; admin fee still charged)", neuC)
+    cell(3, "Financing pips/night long / short", signed(finLongPips) + " / " + signed(finShortPips), neuC)
     cell(4, "Cost c long / short (cap " + str.tostring(costMax, "#.##") + ")", f3(cLong) + " / " + f3(cShort), costOKLong or costOKShort ? okC : badC)
-    cell(5, "Break-even hit rate long / short (q=0.8)", pct(0.5 + cLong / (2 * kATR * 0.8)) + " / " + pct(0.5 + cShort / (2 * kATR * 0.8)), neuC)
-    cell(6, "Score / HTF trend", str.tostring(score) + " / " + (htfTrend == 1 ? "up" : htfTrend == -1 ? "down" : "flat"), neuC)
+    cell(5, "Mid-based break-even long / short (doc formula, q=0.8)", pct(0.5 + cLong / (2 * kATR * 0.8)) + " / " + pct(0.5 + cShort / (2 * kATR * 0.8)), neuC)
+    cell(6, "Score / parent trend", str.tostring(score) + " / " + (isD ? "n/a" : htfTrend == 1 ? "up" : htfTrend == -1 ? "down" : "flat"), neuC)
     cell(7, "Entry window", timeOK ? "open" : (not sessOK ? "outside London/NY" : not relOK ? "release slot" : not rollOK ? "daily close/reopen" : "thin season"), timeOK ? okC : badC)
     cell(8, "Calls / open", str.tostring(nCalls) + " / " + str.tostring(array.size(oDir)), neuC)
     cell(9, "Barrier hits / time stops (q)", str.tostring(nResolved) + " / " + str.tostring(nTime) + "  (" + f3(q) + ")", neuC)
-    cell(10, "Hit rate (Wilson 95% low)", pct(hitRate) + "  (" + pct(hitLow) + ")", not na(hitLow) and not na(pStar) and hitLow > pStar ? okC : neuC)
-    cell(11, "Break-even on these calls p*", pct(pStar), neuC)
-    cell(12, "Net expectancy / call (ATR)", f3(expectancy), not na(expectancy) and expectancy > 0 ? okC : badC)
-    cell(13, "Verdict", not verdictReady ? "not enough calls (" + str.tostring(nClosed) + "/" + str.tostring(minCallsForVerdict) + ")" : edgeShown ? "edge shown ON THIS CHART ONLY" : "no edge shown", edgeShown ? okC : neuC)
-    cell(14, "Note", "in-sample; proof is the walk-forward in Python", color.new(color.gray, 0))
+    cell(10, "Hit rate (weighted 99% low)", pct(hitRate) + "  (" + pct(hitLowW) + ")", not na(hitLowW) and not na(pStar) and hitLowW > pStar ? okC : neuC)
+    cell(11, "Break-even for these calls (spread-aware)", pct(pStar), neuC)
+    cell(12, "Net expectancy / call (ATR)", f3(expectancy) + (na(cAvg) ? "" : "  (needs ≥ " + f3(0.5 * cAvg) + ")"), not na(expectancy) and expectancy > 0 ? okC : badC)
+    cell(13, "On-chart screen", not screenReady ? "not enough closed calls (" + str.tostring(nClosed) + "/" + str.tostring(minCallsForVerdict) + ")" : passesScreen ? "passes the on-chart screen (not a proof)" : "fails the on-chart screen", passesScreen ? okC : neuC)
+    cell(14, "Note", "in-sample, mid data + flat spread, overlapping calls, inputs tuned on these bars; the only proof is the walk-forward in Python", color.new(color.gray, 0))
 
 alertcondition(longCall,  "FX NEXT long call",  "FX NEXT v5 long call on {{ticker}} {{interval}} at {{close}}")
 alertcondition(shortCall, "FX NEXT short call", "FX NEXT v5 short call on {{ticker}} {{interval}} at {{close}}")
