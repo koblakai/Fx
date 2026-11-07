@@ -1,0 +1,84 @@
+//@version=6
+// FX NEXT — 3-minute call/put box
+// One box, one percentage. Green = CALL, red = PUT, yellow = WAIT.
+// The percentage is the empirical frequency with which the current setup (a 13-bucket
+// momentum/mean-reversion score) was followed by an up move over the window, on this chart's
+// own history. It is shrunk toward 50% and only turns green/red when the 95% Wilson interval
+// clears 50% and the probability beats the binary-payout break-even. In-sample by construction.
+indicator("FX NEXT — call/put box", "FXNEXT box", overlay=true)
+
+// ───────────── inputs ─────────────
+windowMin = input.int(3, "Window (minutes)", minval=1, tooltip="Outcome = close after this many minutes vs close now. On a 3m chart this is the next bar; on a 1m chart the next 3 bars.")
+payoutPct = input.float(80.0, "Binary payout (%)", minval=0.0, step=5.0, tooltip="Break-even accuracy = 1 / (1 + payout). 80% payout → 55.6%. 90% → 52.6%. 70% → 58.8%.")
+usePayout = input.bool(true, "Only call/put above the payout break-even")
+margin    = input.float(0.03, "Minimum edge over 50% (floor)", minval=0.0, step=0.01)
+nMin      = input.int(100, "Minimum samples in the current bucket", minval=10)
+shrink    = input.int(20, "Shrink toward 50% (pseudo-counts)", minval=0)
+boxPos    = input.string("top_right", "Box position", options=["top_right", "top_left", "bottom_right", "bottom_left"])
+showN     = input.bool(true, "Show sample size line")
+
+// ───────────── window in bars ─────────────
+tfSec = timeframe.in_seconds()
+H     = math.max(1, math.round(windowMin * 60.0 / tfSec))
+
+// ───────────── setup score (−6 … +6) ─────────────
+sg(float x) => x > 0 ? 1 : x < 0 ? -1 : 0
+e8   = ta.ema(close, 8)
+e21  = ta.ema(close, 21)
+rsi7 = ta.rsi(close, 7)
+hh   = ta.highest(high, 20)
+ll   = ta.lowest(low, 20)
+rp   = (close - ll) / math.max(hh - ll, syminfo.mintick)
+score = sg(close - e8) + sg(e8 - e21) + (rsi7 > 60 ? 1 : rsi7 < 40 ? -1 : 0) + (rp > 0.7 ? 1 : rp < 0.3 ? -1 : 0) + sg(close - close[3]) + sg(e8 - e8[3])
+scoreOK = not na(score)
+
+// ───────────── bucket calibration on this chart's history ─────────────
+var array<int> cnt = array.new<int>(13, 0)
+var array<int> ups = array.new<int>(13, 0)
+
+sPast = score[H]
+cPast = close[H]
+if not na(sPast) and not na(cPast) and close != cPast
+    i = sPast + 6
+    array.set(cnt, i, array.get(cnt, i) + 1)
+    if close > cPast
+        array.set(ups, i, array.get(ups, i) + 1)
+
+idx = nz(score, 0) + 6
+n   = array.get(cnt, idx)
+u   = array.get(ups, idx)
+p   = n + shrink > 0 ? (u + 0.5 * shrink) / (n + shrink) : 0.5   // P(up) for the current setup
+
+wilson(float w, float nn, bool upper) =>
+    float out = na
+    if nn > 0
+        z   = 1.96
+        ph  = w / nn
+        den = 1 + z * z / nn
+        ctr = ph + z * z / (2 * nn)
+        sp  = z * math.sqrt(ph * (1 - ph) / nn + z * z / (4 * nn * nn))
+        out := (upper ? ctr + sp : ctr - sp) / den
+    out
+
+lo = wilson(u, n, false)
+hi = wilson(u, n, true)
+be = usePayout ? math.max(0.5 + margin, 1.0 / (1.0 + payoutPct / 100.0)) : 0.5 + margin
+
+isCall = scoreOK and n >= nMin and p >= be and not na(lo) and lo > 0.5
+isPut  = scoreOK and n >= nMin and 1 - p >= be and not na(hi) and hi < 0.5
+shown  = isCall ? p : isPut ? 1 - p : math.max(p, 1 - p)
+
+// ───────────── the box ─────────────
+pos = boxPos == "top_right" ? position.top_right : boxPos == "top_left" ? position.top_left : boxPos == "bottom_right" ? position.bottom_right : position.bottom_left
+var table box = table.new(pos, 1, 2)
+
+if barstate.islast
+    bg  = isCall ? color.new(color.green, 0) : isPut ? color.new(color.red, 0) : color.new(color.yellow, 0)
+    fg  = isPut ? color.white : color.black
+    txt = (isCall ? "CALL " : isPut ? "PUT " : "WAIT ") + str.tostring(shown * 100, "#") + "%"
+    table.cell(box, 0, 0, txt, bgcolor=bg, text_color=fg, text_size=size.huge)
+    if showN
+        table.cell(box, 0, 1, str.tostring(windowMin) + "-min window · n=" + str.tostring(n) + " · break-even " + str.tostring(be * 100, "#.#") + "% · in-sample", bgcolor=color.new(color.gray, 85), text_color=color.new(color.gray, 0), text_size=size.tiny)
+
+alertcondition(isCall and not isCall[1], "FX NEXT CALL", "FX NEXT box turned CALL on {{ticker}} {{interval}}")
+alertcondition(isPut and not isPut[1],   "FX NEXT PUT",  "FX NEXT box turned PUT on {{ticker}} {{interval}}")
