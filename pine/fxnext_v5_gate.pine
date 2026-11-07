@@ -49,9 +49,29 @@ pip  = pipOverride > 0 ? pipOverride : syminfo.mintick * 10
 spr  = spreadPips * pip
 atr  = ta.atr(atrLen)
 
-// policy rates from TradingView Economics (e.g. ECONOMICS:USINTR); na if the symbol is missing
-baseRate  = request.security("ECONOMICS:" + syminfo.basecurrency + "INTR", "D", close, ignore_invalid_symbol=true)
-quoteRate = request.security("ECONOMICS:" + syminfo.currency + "INTR", "D", close, ignore_invalid_symbol=true)
+// policy rates from TradingView Economics, keyed by two-letter COUNTRY code (ECONOMICS:USINTR, EUINTR, GBINTR, JPINTR …); na if missing
+ccode(string cur) =>
+    switch cur
+        "USD" => "US"
+        "EUR" => "EU"
+        "GBP" => "GB"
+        "JPY" => "JP"
+        "CHF" => "CH"
+        "AUD" => "AU"
+        "NZD" => "NZ"
+        "CAD" => "CA"
+        "SEK" => "SE"
+        "NOK" => "NO"
+        "MXN" => "MX"
+        "ZAR" => "ZA"
+        "SGD" => "SG"
+        "PLN" => "PL"
+        "TRY" => "TR"
+        => ""
+baseCC    = ccode(syminfo.basecurrency)
+quoteCC   = ccode(syminfo.currency)
+baseRate  = request.security("ECONOMICS:" + baseCC + "INTR", "D", close, ignore_invalid_symbol=true)
+quoteRate = request.security("ECONOMICS:" + quoteCC + "INTR", "D", close, ignore_invalid_symbol=true)
 carryOK   = not na(baseRate) and not na(quoteRate)
 float carry = carryOK ? baseRate - quoteRate : na          // % p.a. a long earns before fees
 
